@@ -11,48 +11,34 @@ import (
 	"github.com/yogawahyudi7/golang-rabbitmq/internal/infrastructure/config"
 )
 
-const (
-	// DefaultPoolSize is the default number of channels in the pool
-	DefaultPoolSize = 10
-	// DefaultConfirmTimeout is the default timeout for publisher confirmations
-	DefaultConfirmTimeout = 5 * time.Second
-	// MaxBatchWorkers is the maximum number of workers for batch publishing
-	MaxBatchWorkers = 10
-)
-
-// Publisher represents a RabbitMQ message publisher with channel pool (Production-Ready)
-type Publisher struct {
+// ChannelPoolPublisher represents a RabbitMQ message publisher with channel pool
+type ChannelPoolPublisher struct {
 	conn        *Connection
 	config      config.RabbitMQConfig
-	channelPool chan *PooledChannelV2
+	channelPool chan *PooledChannel
 	poolSize    int
-	deliveryTag uint64 // Atomic counter - NO LOCKS NEEDED!
+	deliveryTag uint64 // Atomic counter
 	mu          sync.RWMutex
 	closed      bool
 }
 
 // PooledChannel wraps an AMQP channel with confirmation handling
-type PooledChannelV2 struct {
+type PooledChannel struct {
 	channel   *amqp.Channel
 	confirms  chan amqp.Confirmation
-	publisher *Publisher
+	publisher *ChannelPoolPublisher
 }
 
-// NewPublisher creates a new RabbitMQ publisher with channel pool
-func NewPublisher(conn *Connection, config config.RabbitMQConfig) (*Publisher, error) {
-	return NewPublisherWithPoolSize(conn, config, DefaultPoolSize)
-}
-
-// NewPublisherWithPoolSize creates a new publisher with specified pool size
-func NewPublisherWithPoolSize(conn *Connection, config config.RabbitMQConfig, poolSize int) (*Publisher, error) {
+// NewChannelPoolPublisher creates a new publisher with channel pool
+func NewChannelPoolPublisher(conn *Connection, config config.RabbitMQConfig, poolSize int) (*ChannelPoolPublisher, error) {
 	if poolSize <= 0 {
-		poolSize = DefaultPoolSize
+		poolSize = 10 // Default pool size
 	}
 
-	publisher := &Publisher{
+	publisher := &ChannelPoolPublisher{
 		conn:        conn,
 		config:      config,
-		channelPool: make(chan *PooledChannelV2, poolSize),
+		channelPool: make(chan *PooledChannel, poolSize),
 		poolSize:    poolSize,
 		deliveryTag: 0,
 	}
@@ -72,7 +58,7 @@ func NewPublisherWithPoolSize(conn *Connection, config config.RabbitMQConfig, po
 }
 
 // createPooledChannel creates a new pooled channel with setup
-func (p *Publisher) createPooledChannel() (*PooledChannelV2, error) {
+func (p *ChannelPoolPublisher) createPooledChannel() (*PooledChannel, error) {
 	channel, err := p.conn.CreateChannel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create channel: %w", err)
@@ -129,7 +115,7 @@ func (p *Publisher) createPooledChannel() (*PooledChannelV2, error) {
 	// Set up confirmation notifications
 	confirms := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
 
-	return &PooledChannelV2{
+	return &PooledChannel{
 		channel:   channel,
 		confirms:  confirms,
 		publisher: p,
@@ -137,7 +123,7 @@ func (p *Publisher) createPooledChannel() (*PooledChannelV2, error) {
 }
 
 // getChannel gets a channel from the pool
-func (p *Publisher) getChannel(ctx context.Context) (*PooledChannelV2, error) {
+func (p *ChannelPoolPublisher) getChannel(ctx context.Context) (*PooledChannel, error) {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -163,7 +149,7 @@ func (p *Publisher) getChannel(ctx context.Context) (*PooledChannelV2, error) {
 }
 
 // returnChannel returns a channel to the pool
-func (p *Publisher) returnChannel(pooledChan *PooledChannelV2) {
+func (p *ChannelPoolPublisher) returnChannel(pooledChan *PooledChannel) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -182,8 +168,13 @@ func (p *Publisher) returnChannel(pooledChan *PooledChannelV2) {
 	}
 }
 
-// Publish publishes a message to RabbitMQ using channel pool (NO LOCKS!)
-func (p *Publisher) Publish(ctx context.Context, body []byte, contentType string) error {
+// getNextDeliveryTag returns the next delivery tag atomically
+func (p *ChannelPoolPublisher) getNextDeliveryTag() uint64 {
+	return atomic.AddUint64(&p.deliveryTag, 1)
+}
+
+// Publish publishes a message using channel pool (NO LOCKS!)
+func (p *ChannelPoolPublisher) Publish(ctx context.Context, body []byte, contentType string) error {
 	// Get channel from pool
 	pooledChan, err := p.getChannel(ctx)
 	if err != nil {
@@ -221,18 +212,18 @@ func (p *Publisher) Publish(ctx context.Context, body []byte, contentType string
 		if !confirmation.Ack {
 			return fmt.Errorf("message nack'd by broker")
 		}
-		// Increment delivery tag atomically for statistics
-		atomic.AddUint64(&p.deliveryTag, 1)
+		// Increment delivery tag for statistics tracking
+		p.getNextDeliveryTag()
 		return nil
-	case <-time.After(DefaultConfirmTimeout):
-		return fmt.Errorf("confirmation timeout after %v", DefaultConfirmTimeout)
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("confirmation timeout")
 	case <-ctx.Done():
 		return fmt.Errorf("confirmation cancelled: %w", ctx.Err())
 	}
 }
 
 // PublishWithRetry publishes a message with retry mechanism
-func (p *Publisher) PublishWithRetry(ctx context.Context, body []byte, contentType string, maxRetries int) error {
+func (p *ChannelPoolPublisher) PublishWithRetry(ctx context.Context, body []byte, contentType string, maxRetries int) error {
 	var lastErr error
 
 	for i := 0; i <= maxRetries; i++ {
@@ -244,7 +235,6 @@ func (p *Publisher) PublishWithRetry(ctx context.Context, body []byte, contentTy
 		lastErr = err
 
 		if i < maxRetries {
-			// Exponential backoff: wait 2^i seconds
 			waitTime := time.Duration(1<<uint(i)) * time.Second
 			select {
 			case <-time.After(waitTime):
@@ -259,11 +249,13 @@ func (p *Publisher) PublishWithRetry(ctx context.Context, body []byte, contentTy
 }
 
 // PublishBatch publishes multiple messages concurrently using channel pool
-func (p *Publisher) PublishBatch(ctx context.Context, messages [][]byte, contentType string) error {
+func (p *ChannelPoolPublisher) PublishBatch(ctx context.Context, messages [][]byte, contentType string) error {
 	// Use worker pool pattern for batch publishing
+	const maxWorkers = 10
+
 	workers := len(messages)
-	if workers > MaxBatchWorkers {
-		workers = MaxBatchWorkers
+	if workers > maxWorkers {
+		workers = maxWorkers
 	}
 
 	jobs := make(chan int, len(messages))
@@ -301,15 +293,28 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages [][]byte, content
 }
 
 // IsHealthy checks if the publisher is healthy
-func (p *Publisher) IsHealthy() bool {
+func (p *ChannelPoolPublisher) IsHealthy() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	return !p.closed && len(p.channelPool) > 0
 }
 
+// GetPoolStats returns pool statistics
+func (p *ChannelPoolPublisher) GetPoolStats() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return map[string]interface{}{
+		"pool_size":      p.poolSize,
+		"available":      len(p.channelPool),
+		"total_messages": atomic.LoadUint64(&p.deliveryTag),
+		"closed":         p.closed,
+	}
+}
+
 // Close closes all channels in the pool
-func (p *Publisher) Close() error {
+func (p *ChannelPoolPublisher) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -326,31 +331,4 @@ func (p *Publisher) Close() error {
 	}
 
 	return nil
-}
-
-// GetActiveConfirmations returns pool statistics (for compatibility)
-func (p *Publisher) GetActiveConfirmations() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	return p.poolSize - len(p.channelPool) // Channels currently in use
-}
-
-// GetDeliveryTag returns the current delivery tag (for monitoring)
-func (p *Publisher) GetDeliveryTag() uint64 {
-	return atomic.LoadUint64(&p.deliveryTag)
-}
-
-// GetPoolStats returns detailed pool statistics
-func (p *Publisher) GetPoolStats() map[string]interface{} {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	return map[string]interface{}{
-		"pool_size":      p.poolSize,
-		"available":      len(p.channelPool),
-		"in_use":         p.poolSize - len(p.channelPool),
-		"total_messages": atomic.LoadUint64(&p.deliveryTag),
-		"closed":         p.closed,
-	}
 }

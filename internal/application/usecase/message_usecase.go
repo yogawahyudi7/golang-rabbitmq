@@ -12,12 +12,13 @@ import (
 	"github.com/yogawahyudi7/golang-rabbitmq/pkg/logger"
 )
 
-// MessageUseCase defines the message use case interface
 type MessageUseCase interface {
 	SendMessage(ctx context.Context, request dto.NewMessageRequestDTO) (*dto.MessageResponseDTO, error)
 	GetMessage(ctx context.Context, id string) (*dto.MessageResponseDTO, error)
 	GetAllMessages(ctx context.Context) ([]*dto.MessageResponseDTO, error)
 	HandleIncomingMessage(ctx context.Context, messageData []byte) error
+	PublishMessage(ctx context.Context, req dto.PublishMessageRequest) error
+	GetMessageStats(ctx context.Context) (*dto.MessageStatsResponse, error)
 }
 
 type messageUseCase struct {
@@ -106,6 +107,58 @@ func (uc *messageUseCase) HandleIncomingMessage(ctx context.Context, messageData
 	}
 
 	return nil
+}
+
+// PublishMessage publishes a message to RabbitMQ
+func (uc *messageUseCase) PublishMessage(ctx context.Context, req dto.PublishMessageRequest) error {
+	// Create message data
+	messageData := map[string]interface{}{
+		"message":    req.Message,
+		"type":       req.Type,
+		"headers":    req.Headers,
+		"timestamp":  time.Now(),
+		"message_id": generateID(),
+	}
+
+	// Convert to JSON
+	messageJSON, err := json.Marshal(messageData)
+	if err != nil {
+		return err
+	}
+
+	// Publish message to RabbitMQ
+	if err := uc.publisher.Publish(ctx, messageJSON, "application/json"); err != nil {
+		return err
+	}
+
+	uc.logger.WithFields(map[string]interface{}{
+		"message": req.Message,
+		"type":    req.Type,
+	}).Info("Message published successfully")
+
+	return nil
+}
+
+// GetMessageStats returns message statistics
+func (uc *messageUseCase) GetMessageStats(ctx context.Context) (*dto.MessageStatsResponse, error) {
+	// Get pool stats from publisher
+	poolStats := uc.publisher.GetPoolStats()
+
+	// Create response
+	response := &dto.MessageStatsResponse{
+		TotalPublished: int64(poolStats["total_messages"].(int)),
+		TotalConsumed:  0, // This would need to be tracked separately
+		LastActivity:   time.Now(),
+	}
+
+	// Set queue status
+	response.QueueStatus.Name = "message_queue"
+	response.QueueStatus.Messages = poolStats["in_use"].(int)
+	response.QueueStatus.Consumers = 1
+	response.QueueStatus.MessageRate = 0  // This would need rate calculation
+	response.QueueStatus.DeliveryRate = 0 // This would need rate calculation
+
+	return response, nil
 }
 
 // Helper functions
